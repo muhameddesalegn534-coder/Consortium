@@ -248,7 +248,7 @@ try {
 
             if ($hasRatesCols) {
                 // Insert including persisted custom rate columns
-                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             } else {
                 // Legacy insert without custom rate columns
                 $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -384,25 +384,23 @@ try {
                 
                 // Update the quarter row: increase actual by amount, and decrease forecast by the same amount (do NOT set forecast = budget - actual)
                 // MySQL evaluates SET clauses left to right, so later expressions see updated column values
-                $updateBudgetQuery = "UPDATE budget_data SET 
-                    actual = COALESCE(actual, 0) + ?,
-                    forecast = GREATEST(COALESCE(forecast, 0) - ?, 0),
-                    actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                    WHERE year2 = ? AND category_name = ? AND period_name = ?
+                $updateBudgetQuery = "UPDATE budget_data SET \
+                    actual = COALESCE(actual, 0) + ?, \
+                    forecast = GREATEST(COALESCE(forecast, 0) - ?, 0), \
+                    actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) \
+                    WHERE year2 = ? AND category_name = ? AND period_name = ? \
                     AND ? BETWEEN start_date AND end_date";
-                
-                // Add cluster condition if user has a cluster
                 if ($userCluster) {
                     $updateBudgetQuery .= " AND cluster = ?";
                     $updateStmt = $conn->prepare($updateBudgetQuery);
-                    // Params: 2 doubles (amount for actual increase and forecast decrease), 1 integer (year), 4 strings (categoryName, quarter, transactionDate, userCluster)
                     $updateStmt->bind_param("ddissss", $amountInBudgetCurrency, $amountInBudgetCurrency, $year, $categoryName, $quarter, $transactionDate, $userCluster);
                 } else {
                     $updateStmt = $conn->prepare($updateBudgetQuery);
-                    // Params: 2 doubles (amount for actual increase and forecast decrease), 1 integer (year), 3 strings (categoryName, quarter, transactionDate)
                     $updateStmt->bind_param("ddisss", $amountInBudgetCurrency, $amountInBudgetCurrency, $year, $categoryName, $quarter, $transactionDate);
                 }
-                
+                $updateStmt->execute();
+
+                // Add the missing comprehensive budget updates that match save_transaction functionality
                 if ($updateStmt->execute()) {
                     error_log('AJAX Handler - Updated quarter budget and actual amounts');
                     
@@ -413,213 +411,209 @@ try {
                             FROM budget_data b2 
                             WHERE b2.year2 = ? AND b2.category_name = ? AND b2.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
 
-                    // Add cluster condition if user has a cluster (subquery)
-                    if ($userCluster) {
-                        $updateAnnualQuery .= " AND b2.cluster = ?";
-                    }
+                        // Add cluster condition if user has a cluster (subquery)
+                        if ($userCluster) {
+                            $updateAnnualQuery .= " AND b2.cluster = ?";
+                        }
 
-                    // Target only the Annual Total row for this category/year (and cluster)
-                    $updateAnnualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
-                    if ($userCluster) {
-                        $updateAnnualQuery .= " AND cluster = ?";
-                        $annualStmt = $conn->prepare($updateAnnualQuery);
-                        // Params: subquery (year, category, cluster), outer where (year, category, cluster)
-                        $annualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                        // Target only the Annual Total row for this category/year (and cluster)
+                        $updateAnnualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                        if ($userCluster) {
+                            $updateAnnualQuery .= " AND cluster = ?";
+                            $annualStmt = $conn->prepare($updateAnnualQuery);
+                            // Params: subquery (year, category, cluster), outer where (year, category, cluster)
+                            $annualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                        } else {
+                            $annualStmt = $conn->prepare($updateAnnualQuery);
+                            // Params: subquery (year, category), outer where (year, category)
+                            $annualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                        }
+
+                        $annualStmt->execute();
+                        
+                        // Update actual for Annual Total with cluster consideration
+                        $updateActualQuery = "UPDATE budget_data 
+                            SET actual = (
+                                SELECT SUM(COALESCE(actual, 0)) 
+                                FROM budget_data b3 
+                                WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+
+                        if ($userCluster) {
+                            $updateActualQuery .= " AND b3.cluster = ?";
+                        }
+
+                        $updateActualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                        if ($userCluster) {
+                            $updateActualQuery .= " AND cluster = ?";
+                            $actualStmt = $conn->prepare($updateActualQuery);
+                            $actualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                        } else {
+                            $actualStmt = $conn->prepare($updateActualQuery);
+                            $actualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                        }
+
+                        $actualStmt->execute();
+                        
+                        // Synchronize Annual Total forecast as sum of quarter forecasts with cluster consideration
+                        $updateAnnualForecastSumQuery = "UPDATE budget_data 
+                            SET forecast = (
+                                SELECT COALESCE(SUM(forecast), 0)
+                                FROM budget_data b 
+                                WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                        if ($userCluster) {
+                            $updateAnnualForecastSumQuery .= " AND b.cluster = ?";
+                        }
+                        $updateAnnualForecastSumQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                        if ($userCluster) {
+                            $updateAnnualForecastSumQuery .= " AND cluster = ?";
+                            $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                            $annualForecastSumStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
+                        } else {
+                            $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
+                            $annualForecastSumStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                        }
+                        $annualForecastSumStmt->execute();
+
+                        // Update actual_plus_forecast for Annual Total with cluster consideration
+                        $updateAnnualForecastQuery = "UPDATE budget_data 
+                            SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                            WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                        
+                        // Add cluster condition if user has a cluster
+                        if ($userCluster) {
+                            $updateAnnualForecastQuery .= " AND cluster = ?";
+                            $annualForecastStmt = $conn->prepare($updateAnnualForecastQuery);
+                            $annualForecastStmt->bind_param("iss", $year, $categoryName, $userCluster);
+                        } else {
+                            $annualForecastStmt = $conn->prepare($updateAnnualForecastQuery);
+                            $annualForecastStmt->bind_param("is", $year, $categoryName);
+                        }
+                        $annualForecastStmt->execute();
+                        
+                        // Update the Total row across all categories with cluster consideration
+                        $updateTotalQuery = "UPDATE budget_data 
+                            SET budget = (
+                                SELECT SUM(COALESCE(budget, 0)) 
+                                FROM budget_data b2 
+                                WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
+
+                        if ($userCluster) {
+                            $updateTotalQuery .= " AND b2.cluster = ?";
+                        }
+
+                        $updateTotalQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                        if ($userCluster) {
+                            $updateTotalQuery .= " AND cluster = ?";
+                            $totalBudgetStmt = $conn->prepare($updateTotalQuery);
+                            // Params: subquery (year, cluster), outer where (year, cluster)
+                            $totalBudgetStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
+                        } else {
+                            $totalBudgetStmt = $conn->prepare($updateTotalQuery);
+                            // Params: subquery (year), outer where (year)
+                            $totalBudgetStmt->bind_param("ii", $year, $year);
+                        }
+                        $totalBudgetStmt->execute();
+                        
+                        // Update actual for Total with cluster consideration
+                        $updateTotalActualQuery = "UPDATE budget_data 
+                            SET actual = (
+                                SELECT SUM(COALESCE(actual, 0)) 
+                                FROM budget_data b3 
+                                WHERE b3.year2 = ? AND b3.period_name = 'Annual Total' AND b3.category_name != 'Total'";
+
+                        if ($userCluster) {
+                            $updateTotalActualQuery .= " AND b3.cluster = ?";
+                        }
+
+                        $updateTotalActualQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                        if ($userCluster) {
+                            $updateTotalActualQuery .= " AND cluster = ?";
+                            $totalActualStmt = $conn->prepare($updateTotalActualQuery);
+                            $totalActualStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
+                        } else {
+                            $totalActualStmt = $conn->prepare($updateTotalActualQuery);
+                            $totalActualStmt->bind_param("ii", $year, $year);
+                        }
+                        $totalActualStmt->execute();
+                        
+                        // Synchronize Total forecast as sum of Annual Total forecasts across categories with cluster consideration
+                        $updateTotalForecastSumQuery = "UPDATE budget_data 
+                            SET forecast = (
+                                SELECT COALESCE(SUM(forecast), 0)
+                                FROM budget_data b2 
+                                WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
+                        if ($userCluster) {
+                            $updateTotalForecastSumQuery .= " AND b2.cluster = ?";
+                        }
+                        $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                        if ($userCluster) {
+                            // Ensure outer update also filters by cluster to match bound parameters
+                            $updateTotalForecastSumQuery .= " AND cluster = ?";
+                            $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                            $updateTotalForecastSumStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
+                        } else {
+                            $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
+                            $updateTotalForecastSumStmt->bind_param("ii", $year, $year);
+                        }
+                        $updateTotalForecastSumStmt->execute();
+
+                        // Update actual_plus_forecast for Total with cluster consideration
+                        $updateTotalActualForecastQuery = "UPDATE budget_data 
+                            SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                            WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
+                        
+                        // Add cluster condition if user has a cluster
+                        if ($userCluster) {
+                            $updateTotalActualForecastQuery .= " AND cluster = ?";
+                            $totalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
+                            $totalActualForecastStmt->bind_param("is", $year, $userCluster);
+                        } else {
+                            $totalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
+                            $totalActualForecastStmt->bind_param("i", $year);
+                        }
+                        $totalActualForecastStmt->execute();
+                        
+                        // Update actual_plus_forecast for all quarter rows as well with cluster consideration
+                        $updateQuarterForecastQuery = "UPDATE budget_data 
+                            SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                            WHERE year2 = ? AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                        
+                        // Add cluster condition if user has a cluster
+                        if ($userCluster) {
+                            $updateQuarterForecastQuery .= " AND cluster = ?";
+                            $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
+                            $quarterForecastStmt->bind_param("is", $year, $userCluster);
+                        } else {
+                            $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
+                            $quarterForecastStmt->bind_param("i", $year);
+                        }
+                        $quarterForecastStmt->execute();
+                        
+                        // Calculate and update variance percentages for all rows with cluster consideration
+                        // Variance (%) = (Budget − Actual) / Budget × 100
+                        $varianceQuery = "UPDATE budget_data 
+                            SET variance_percentage = CASE 
+                                WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
+                                WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
+                                ELSE 0.00 
+                            END
+                            WHERE year2 = ?";
+                        
+                        // Add cluster condition if user has a cluster
+                        if ($userCluster) {
+                            $varianceQuery .= " AND cluster = ?";
+                            $varianceStmt = $conn->prepare($varianceQuery);
+                            $varianceStmt->bind_param("is", $year, $userCluster);
+                        } else {
+                            $varianceStmt = $conn->prepare($varianceQuery);
+                            $varianceStmt->bind_param("i", $year);
+                        }
+                        $varianceStmt->execute();
+                        
+                        error_log('AJAX Handler - Updated all related budget calculations including budget reduction');
                     } else {
-                        $annualStmt = $conn->prepare($updateAnnualQuery);
-                        // Params: subquery (year, category), outer where (year, category)
-                        $annualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
+                        error_log('AJAX Handler - Failed to update budget_data: ' . $updateStmt->error);
                     }
-
-                    $annualStmt->execute();
-                    
-                    // Update actual for Annual Total with cluster consideration
-                    $updateActualQuery = "UPDATE budget_data 
-                        SET actual = (
-                            SELECT SUM(COALESCE(actual, 0)) 
-                            FROM budget_data b3 
-                            WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-
-                    if ($userCluster) {
-                        $updateActualQuery .= " AND b3.cluster = ?";
-                    }
-
-                    $updateActualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
-                    if ($userCluster) {
-                        $updateActualQuery .= " AND cluster = ?";
-                        $actualStmt = $conn->prepare($updateActualQuery);
-                        $actualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
-                    } else {
-                        $actualStmt = $conn->prepare($updateActualQuery);
-                        $actualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
-                    }
-
-                    $actualStmt->execute();
-                    
-                    // Do not auto-update forecast for Annual Total; forecast remains manual
-                    
-                    // Synchronize Annual Total forecast as sum of quarter forecasts with cluster consideration
-                    $updateAnnualForecastSumQuery = "UPDATE budget_data 
-                        SET forecast = (
-                            SELECT COALESCE(SUM(forecast), 0)
-                            FROM budget_data b 
-                            WHERE b.year2 = ? AND b.category_name = ? AND b.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-                    if ($userCluster) {
-                        $updateAnnualForecastSumQuery .= " AND b.cluster = ?";
-                    }
-                    $updateAnnualForecastSumQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
-                    if ($userCluster) {
-                        $updateAnnualForecastSumQuery .= " AND cluster = ?";
-                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
-                        $annualForecastSumStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster);
-                    } else {
-                        $annualForecastSumStmt = $conn->prepare($updateAnnualForecastSumQuery);
-                        $annualForecastSumStmt->bind_param("isis", $year, $categoryName, $year, $categoryName);
-                    }
-                    $annualForecastSumStmt->execute();
-
-                    // Update actual_plus_forecast for Annual Total with cluster consideration
-                    $updateAnnualForecastQuery = "UPDATE budget_data 
-                        SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                        WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
-                    
-                    // Add cluster condition if user has a cluster
-                    if ($userCluster) {
-                        $updateAnnualForecastQuery .= " AND cluster = ?";
-                        $annualForecastStmt = $conn->prepare($updateAnnualForecastQuery);
-                        $annualForecastStmt->bind_param("iss", $year, $categoryName, $userCluster);
-                    } else {
-                        $annualForecastStmt = $conn->prepare($updateAnnualForecastQuery);
-                        $annualForecastStmt->bind_param("is", $year, $categoryName);
-                    }
-                    $annualForecastStmt->execute();
-                    
-                    // Update the Total row across all categories with cluster consideration
-                    $updateTotalQuery = "UPDATE budget_data 
-                        SET budget = (
-                            SELECT SUM(COALESCE(budget, 0)) 
-                            FROM budget_data b2 
-                            WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
-
-                    if ($userCluster) {
-                        $updateTotalQuery .= " AND b2.cluster = ?";
-                    }
-
-                    $updateTotalQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
-                    if ($userCluster) {
-                        $updateTotalQuery .= " AND cluster = ?";
-                        $totalBudgetStmt = $conn->prepare($updateTotalQuery);
-                        // Params: subquery (year, cluster), outer where (year, cluster)
-                        $totalBudgetStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
-                    } else {
-                        $totalBudgetStmt = $conn->prepare($updateTotalQuery);
-                        // Params: subquery (year), outer where (year)
-                        $totalBudgetStmt->bind_param("ii", $year, $year);
-                    }
-                    $totalBudgetStmt->execute();
-                    
-                    // Update actual for Total with cluster consideration
-                    $updateTotalActualQuery = "UPDATE budget_data 
-                        SET actual = (
-                            SELECT SUM(COALESCE(actual, 0)) 
-                            FROM budget_data b3 
-                            WHERE b3.year2 = ? AND b3.period_name = 'Annual Total' AND b3.category_name != 'Total'";
-
-                    if ($userCluster) {
-                        $updateTotalActualQuery .= " AND b3.cluster = ?";
-                    }
-
-                    $updateTotalActualQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
-                    if ($userCluster) {
-                        $updateTotalActualQuery .= " AND cluster = ?";
-                        $totalActualStmt = $conn->prepare($updateTotalActualQuery);
-                        $totalActualStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
-                    } else {
-                        $totalActualStmt = $conn->prepare($updateTotalActualQuery);
-                        $totalActualStmt->bind_param("ii", $year, $year);
-                    }
-                    $totalActualStmt->execute();
-                    
-                    // Do not auto-update forecast for Total; forecast remains manual
-                    
-                    // Synchronize Total forecast as sum of Annual Total forecasts across categories with cluster consideration
-                    $updateTotalForecastSumQuery = "UPDATE budget_data 
-                        SET forecast = (
-                            SELECT COALESCE(SUM(forecast), 0)
-                            FROM budget_data b2 
-                            WHERE b2.year2 = ? AND b2.period_name = 'Annual Total' AND b2.category_name != 'Total'";
-                    if ($userCluster) {
-                        $updateTotalForecastSumQuery .= " AND b2.cluster = ?";
-                    }
-                    $updateTotalForecastSumQuery .= ") WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
-                    if ($userCluster) {
-                        // Ensure outer update also filters by cluster to match bound parameters
-                        $updateTotalForecastSumQuery .= " AND cluster = ?";
-                        $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
-                        $updateTotalForecastSumStmt->bind_param("isis", $year, $userCluster, $year, $userCluster);
-                    } else {
-                        $updateTotalForecastSumStmt = $conn->prepare($updateTotalForecastSumQuery);
-                        $updateTotalForecastSumStmt->bind_param("ii", $year, $year);
-                    }
-                    $updateTotalForecastSumStmt->execute();
-
-                    // Update actual_plus_forecast for Total with cluster consideration
-                    $updateTotalActualForecastQuery = "UPDATE budget_data 
-                        SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                        WHERE year2 = ? AND category_name = 'Total' AND period_name = 'Total'";
-                    
-                    // Add cluster condition if user has a cluster
-                    if ($userCluster) {
-                        $updateTotalActualForecastQuery .= " AND cluster = ?";
-                        $totalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
-                        $totalActualForecastStmt->bind_param("is", $year, $userCluster);
-                    } else {
-                        $totalActualForecastStmt = $conn->prepare($updateTotalActualForecastQuery);
-                        $totalActualForecastStmt->bind_param("i", $year);
-                    }
-                    $totalActualForecastStmt->execute();
-                    
-                    // Update actual_plus_forecast for all quarter rows as well with cluster consideration
-                    $updateQuarterForecastQuery = "UPDATE budget_data 
-                        SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                        WHERE year2 = ? AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
-                    
-                    // Add cluster condition if user has a cluster
-                    if ($userCluster) {
-                        $updateQuarterForecastQuery .= " AND cluster = ?";
-                        $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
-                        $quarterForecastStmt->bind_param("is", $year, $userCluster);
-                    } else {
-                        $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
-                        $quarterForecastStmt->bind_param("i", $year);
-                    }
-                    $quarterForecastStmt->execute();
-                    
-                    // Calculate and update variance percentages for all rows with cluster consideration
-                    // Variance (%) = (Budget − Actual) / Budget × 100
-                    $varianceQuery = "UPDATE budget_data 
-                        SET variance_percentage = CASE 
-                            WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
-                            WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
-                            ELSE 0.00 
-                        END
-                        WHERE year2 = ?";
-                    
-                    // Add cluster condition if user has a cluster
-                    if ($userCluster) {
-                        $varianceQuery .= " AND cluster = ?";
-                        $varianceStmt = $conn->prepare($varianceQuery);
-                        $varianceStmt->bind_param("is", $year, $userCluster);
-                    } else {
-                        $varianceStmt = $conn->prepare($varianceQuery);
-                        $varianceStmt->bind_param("i", $year);
-                    }
-                    $varianceStmt->execute();
-                    
-                    error_log('AJAX Handler - Updated all related budget calculations including budget reduction');
-                } else {
-                    error_log('AJAX Handler - Failed to update budget_data: ' . $updateStmt->error);
-                }
                 
                 // Mark budget data as uncertified when new transaction is added with cluster consideration
                 $uncertifyQuery = "UPDATE budget_data SET certified = 'uncertified' WHERE year2 = ?";
@@ -747,7 +741,8 @@ try {
 
                     // Header row
                     for ($col = 1; $col <= $highestColumnIndex; $col++) {
-                        $label = $worksheet->getCellByColumnAndRow($col, 1)->getValue();
+                        $coordinate = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col) . '1';
+                        $label = $worksheet->getCell($coordinate)->getValue();
                         $headers[$col] = $normalizeHeader($label);
                     }
 
@@ -756,7 +751,8 @@ try {
                         $record = [];
                         for ($col = 1; $col <= $highestColumnIndex; $col++) {
                             $headerKey = $headers[$col] ?? ('col_' . $col);
-                            $record[$headerKey] = trim((string)$worksheet->getCellByColumnAndRow($col, $row)->getValue());
+                            $coordinate = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col) . $row;
+                            $record[$headerKey] = trim((string)$worksheet->getCell($coordinate)->getValue());
                         }
                         // Skip completely empty rows
                         $isEmpty = true;
@@ -876,10 +872,10 @@ try {
                     $entryDateTime = new DateTime($entryDate);
                     $entryYear = (int)$entryDateTime->format('Y');
 
-                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency
-                                 FROM budget_data
-                                 WHERE year2 = ? AND category_name = ?
-                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')
+                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency 
+                                 FROM budget_data 
+                                 WHERE year2 = ? AND category_name = ? 
+                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4') 
                                  AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) { $quarterBudgetQuery .= " AND cluster = ?"; }
                     $quarterBudgetQuery .= " LIMIT 1";
@@ -953,9 +949,9 @@ try {
                     $quarter = $quarterPeriod;
                     $year = $entryYear;
 
-                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data
-                                   WHERE year2 = ? AND category_name = ?
-                                   AND period_name = ?
+                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data 
+                                   WHERE year2 = ? AND category_name = ? 
+                                   AND period_name = ? 
                                    AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) {
                         $budgetCheckQuery .= " AND cluster = ?";
@@ -972,11 +968,11 @@ try {
                     $budgetCurrency = $budgetCheckData['currency'] ?? 'ETB';
                     $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $effectiveRates);
 
-                    $updateBudgetQuery = "UPDATE budget_data SET
-                        actual = COALESCE(actual, 0) + ?,
-                        forecast = GREATEST(COALESCE(forecast, 0) - ?, 0),
-                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                        WHERE year2 = ? AND category_name = ? AND period_name = ?
+                    $updateBudgetQuery = "UPDATE budget_data SET \
+                        actual = COALESCE(actual, 0) + ?, \
+                        forecast = GREATEST(COALESCE(forecast, 0) - ?, 0), \
+                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) \
+                        WHERE year2 = ? AND category_name = ? AND period_name = ? \
                         AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) {
                         $updateBudgetQuery .= " AND cluster = ?";
@@ -996,10 +992,10 @@ try {
 
                     // Sync annual totals and preview row the same way as save_transaction
                     // Annual budget (sum of quarters)
-                    $updateAnnualQuery = "UPDATE budget_data
-                        SET budget = (
-                            SELECT SUM(COALESCE(budget, 0))
-                            FROM budget_data b2
+                    $updateAnnualQuery = "UPDATE budget_data \
+                        SET budget = ( \
+                            SELECT SUM(COALESCE(budget, 0)) \
+                            FROM budget_data b2 \
                             WHERE b2.year2 = ? AND b2.category_name = ? AND b2.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
                     if ($userCluster) { $updateAnnualQuery .= " AND b2.cluster = ?"; }
                     $updateAnnualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
@@ -1008,10 +1004,10 @@ try {
                     $annualStmt->execute();
 
                     // Annual actual (sum of quarters)
-                    $updateActualQuery = "UPDATE budget_data
-                        SET actual = (
-                            SELECT SUM(COALESCE(actual, 0))
-                            FROM budget_data b3
+                    $updateActualQuery = "UPDATE budget_data \
+                        SET actual = ( \
+                            SELECT SUM(COALESCE(actual, 0)) \
+                            FROM budget_data b3 \
                             WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
                     if ($userCluster) { $updateActualQuery .= " AND b3.cluster = ?"; }
                     $updateActualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
@@ -1449,44 +1445,65 @@ try {
                         throw new Exception("Failed to update Total actual_plus_forecast: " . $totalApfStmt->error);
                     }
 
-                    // Update actual_plus_forecast for all quarter rows
+                    // Update actual_plus_forecast for all quarter rows as well with cluster consideration
                     $updateQuarterForecastQuery = "UPDATE budget_data 
                         SET actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
-                        WHERE year2 = ? AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')" . 
-                        ($userCluster ? " AND cluster = ?" : "");
+                        WHERE year2 = ? AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
                     
+                    // Add cluster condition if user has a cluster
                     if ($userCluster) {
+                        $updateQuarterForecastQuery .= " AND cluster = ?";
                         $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
                         $quarterForecastStmt->bind_param("is", $year, $userCluster);
                     } else {
                         $quarterForecastStmt = $conn->prepare($updateQuarterForecastQuery);
                         $quarterForecastStmt->bind_param("i", $year);
                     }
+                    $quarterForecastStmt->execute();
                     
-                    if (!$quarterForecastStmt->execute()) {
-                        throw new Exception("Failed to update quarter forecast data: " . $quarterForecastStmt->error);
-                    }
-                    
-                    // Calculate and update variance percentages
+                    // Calculate and update variance percentages for all rows with cluster consideration
+                    // Variance (%) = (Budget − Actual) / Budget × 100
                     $varianceQuery = "UPDATE budget_data 
                         SET variance_percentage = CASE 
                             WHEN budget > 0 THEN ROUND((((budget - COALESCE(actual,0)) / ABS(budget)) * 100), 2)
                             WHEN budget = 0 AND COALESCE(actual,0) > 0 THEN -100.00
                             ELSE 0.00 
                         END
-                        WHERE year2 = ?" . ($userCluster ? " AND cluster = ?" : "");
+                        WHERE year2 = ?";
                     
+                    // Add cluster condition if user has a cluster
                     if ($userCluster) {
+                        $varianceQuery .= " AND cluster = ?";
                         $varianceStmt = $conn->prepare($varianceQuery);
                         $varianceStmt->bind_param("is", $year, $userCluster);
                     } else {
                         $varianceStmt = $conn->prepare($varianceQuery);
                         $varianceStmt->bind_param("i", $year);
                     }
+                    $varianceStmt->execute();
                     
-                    if (!$varianceStmt->execute()) {
-                        throw new Exception("Failed to update variance percentages: " . $varianceStmt->error);
-                    }
+                    error_log('AJAX Handler - Updated all related budget calculations including budget reduction');
+                } else {
+                    error_log('AJAX Handler - Failed to update budget_data: ' . $updateStmt->error);
+                }
+                
+                // Mark budget data as uncertified when new transaction is added with cluster consideration
+                $uncertifyQuery = "UPDATE budget_data SET certified = 'uncertified' WHERE year2 = ?";
+                
+                // Add cluster condition if user has a cluster
+                if ($userCluster) {
+                    $uncertifyQuery .= " AND cluster = ?";
+                    $uncertifyStmt = $conn->prepare($uncertifyQuery);
+                    $uncertifyStmt->bind_param("is", $year, $userCluster);
+                } else {
+                    $uncertifyStmt = $conn->prepare($uncertifyQuery);
+                    $uncertifyStmt->bind_param("i", $year);
+                }
+                
+                if ($uncertifyStmt->execute()) {
+                    error_log('AJAX Handler - Budget marked as uncertified due to new transaction for year: ' . $year);
+                } else {
+                    error_log('AJAX Handler - Failed to mark budget as uncertified: ' . $uncertifyStmt->error);
                 }
                 
                 // Commit transaction
