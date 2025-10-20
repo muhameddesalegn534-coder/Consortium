@@ -878,10 +878,10 @@ try {
                     $entryDateTime = new DateTime($entryDate);
                     $entryYear = (int)$entryDateTime->format('Y');
 
-                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency \
-                                 FROM budget_data \
-                                 WHERE year2 = ? AND category_name = ? \
-                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4') \
+                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency 
+                                 FROM budget_data 
+                                 WHERE year2 = ? AND category_name = ? 
+                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4') 
                                  AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) { $quarterBudgetQuery .= " AND cluster = ?"; }
                     $quarterBudgetQuery .= " LIMIT 1";
@@ -955,9 +955,9 @@ try {
                     $quarter = $quarterPeriod;
                     $year = $entryYear;
 
-                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data \
-                                   WHERE year2 = ? AND category_name = ? \
-                                   AND period_name = ? \
+                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data 
+                                   WHERE year2 = ? AND category_name = ? 
+                                   AND period_name = ? 
                                    AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) {
                         $budgetCheckQuery .= " AND cluster = ?";
