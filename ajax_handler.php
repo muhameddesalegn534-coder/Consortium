@@ -265,7 +265,8 @@ try {
 
             if ($hasRatesCols) {
                 // Insert including persisted custom rate columns
-                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                // NOTE: 28 columns and 28 placeholders (to match bind_param below)
+                $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             } else {
                 // Legacy insert without custom rate columns
                 $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -869,6 +870,7 @@ try {
                     $useCustomRateFlag = 0;
                     $usdToEtbPersist = null;
                     $eurToEtbPersist = null;
+                    $usdToEurPersist = null; // keep slot alignment with save_transaction
                     if (isClusterCustomCurrencyEnabled($conn, $userCluster)) {
                         if ($usdRate !== null && is_numeric($usdRate) && floatval($usdRate) > 0) {
                             $effectiveRates['USD_to_ETB'] = floatval($usdRate);
@@ -934,6 +936,7 @@ try {
 
                     // Insert into budget_preview
                     if ($hasRatesCols) {
+                        // 28 columns and 28 placeholders to match bind_param list
                         $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
                         $empty = '';
                         $actualSpent = $currentActual;
@@ -942,7 +945,7 @@ try {
                             $entryDate, $amountInBudgetCurrency, $pvNumber, $empty, $empty, $empty,
                             $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent,
                             $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency,
-                            $empty, $empty, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEtbPersist /* keep slot */
+                            $empty, $empty, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEurPersist
                         );
                     } else {
                         $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
