@@ -876,10 +876,10 @@ try {
                     $entryDateTime = new DateTime($entryDate);
                     $entryYear = (int)$entryDateTime->format('Y');
 
-                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency \
-                                 FROM budget_data \
-                                 WHERE year2 = ? AND category_name = ? \
-                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4') \
+                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency
+                                 FROM budget_data
+                                 WHERE year2 = ? AND category_name = ?
+                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4')
                                  AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) { $quarterBudgetQuery .= " AND cluster = ?"; }
                     $quarterBudgetQuery .= " LIMIT 1";
@@ -953,9 +953,9 @@ try {
                     $quarter = $quarterPeriod;
                     $year = $entryYear;
 
-                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data \
-                                   WHERE year2 = ? AND category_name = ? \
-                                   AND period_name = ? \
+                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data
+                                   WHERE year2 = ? AND category_name = ?
+                                   AND period_name = ?
                                    AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) {
                         $budgetCheckQuery .= " AND cluster = ?";
@@ -972,11 +972,11 @@ try {
                     $budgetCurrency = $budgetCheckData['currency'] ?? 'ETB';
                     $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $effectiveRates);
 
-                    $updateBudgetQuery = "UPDATE budget_data SET \
-                        actual = COALESCE(actual, 0) + ?, \
-                        forecast = GREATEST(COALESCE(forecast, 0) - ?, 0), \
-                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) \
-                        WHERE year2 = ? AND category_name = ? AND period_name = ? \
+                    $updateBudgetQuery = "UPDATE budget_data SET
+                        actual = COALESCE(actual, 0) + ?,
+                        forecast = GREATEST(COALESCE(forecast, 0) - ?, 0),
+                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0)
+                        WHERE year2 = ? AND category_name = ? AND period_name = ?
                         AND ? BETWEEN start_date AND end_date";
                     if ($userCluster) {
                         $updateBudgetQuery .= " AND cluster = ?";
@@ -996,10 +996,10 @@ try {
 
                     // Sync annual totals and preview row the same way as save_transaction
                     // Annual budget (sum of quarters)
-                    $updateAnnualQuery = "UPDATE budget_data \
-                        SET budget = ( \
-                            SELECT SUM(COALESCE(budget, 0)) \
-                            FROM budget_data b2 \
+                    $updateAnnualQuery = "UPDATE budget_data
+                        SET budget = (
+                            SELECT SUM(COALESCE(budget, 0))
+                            FROM budget_data b2
                             WHERE b2.year2 = ? AND b2.category_name = ? AND b2.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
                     if ($userCluster) { $updateAnnualQuery .= " AND b2.cluster = ?"; }
                     $updateAnnualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
@@ -1008,10 +1008,10 @@ try {
                     $annualStmt->execute();
 
                     // Annual actual (sum of quarters)
-                    $updateActualQuery = "UPDATE budget_data \
-                        SET actual = ( \
-                            SELECT SUM(COALESCE(actual, 0)) \
-                            FROM budget_data b3 \
+                    $updateActualQuery = "UPDATE budget_data
+                        SET actual = (
+                            SELECT SUM(COALESCE(actual, 0))
+                            FROM budget_data b3
                             WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
                     if ($userCluster) { $updateActualQuery .= " AND b3.cluster = ?"; }
                     $updateActualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
