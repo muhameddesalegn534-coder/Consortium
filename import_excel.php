@@ -819,8 +819,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['excel_file'])) {
             const formData = new FormData();
             formData.append('excel_file', file);
             
-            // Send AJAX request
-            fetch('import_excel.php', {
+            // Send AJAX request to server handler
+            fetch('ajax_handler.php?action=import_excel', {
                 method: 'POST',
                 body: formData
             })
