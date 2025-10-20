@@ -687,6 +687,400 @@ try {
             $stmt->close();
             break;
 
+        case 'import_excel':
+            // Bulk import transactions from an uploaded Excel/CSV file
+            // Align logic with save_transaction: currency handling, budget linkage, and updates
+            try {
+                // Start session to get user cluster
+                session_start();
+                $userCluster = $_SESSION['cluster_name'] ?? null;
+
+                // Include currency functions
+                include 'currency_functions.php';
+
+                // Gather cluster currency rates (MySQLi variant) with sane defaults
+                $currencyRates = [];
+                if ($userCluster) {
+                    $currencyRates = getCurrencyRatesByClusterNameMySQLi($conn, $userCluster);
+                }
+                if (!$currencyRates) {
+                    $currencyRates = [
+                        'USD_to_ETB' => 55.0000,
+                        'EUR_to_ETB' => 60.0000,
+                    ];
+                }
+
+                // Validate file upload
+                if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
+                    handleError('No file uploaded or upload error', 'Missing excel_file in request');
+                }
+
+                $fileName = $_FILES['excel_file']['name'] ?? 'upload';
+                $fileTmpPath = $_FILES['excel_file']['tmp_name'];
+                $ext = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+
+                // Helper to normalize header names like "Budget Heading" -> "budget_heading"
+                $normalizeHeader = static function ($label) {
+                    $v = strtolower(trim((string)$label));
+                    $v = preg_replace('/[^a-z0-9]+/i', '_', $v);
+                    return trim($v, '_');
+                };
+
+                // Read rows from Excel/CSV into an array of associative arrays
+                $rows = [];
+                $headers = [];
+
+                if (in_array($ext, ['xlsx', 'xls'])) {
+                    // Try PhpSpreadsheet
+                    $autoloadPath = __DIR__ . '/vendor/autoload.php';
+                    if (!file_exists($autoloadPath)) {
+                        handleError('Excel import requires PhpSpreadsheet', 'Run composer install to enable Excel parsing');
+                    }
+                    require_once $autoloadPath;
+
+                    $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($fileTmpPath);
+                    $worksheet = $spreadsheet->getActiveSheet();
+
+                    $highestRow = $worksheet->getHighestRow();
+                    $highestColumn = $worksheet->getHighestColumn();
+                    $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+
+                    // Header row
+                    for ($col = 1; $col <= $highestColumnIndex; $col++) {
+                        $label = $worksheet->getCellByColumnAndRow($col, 1)->getValue();
+                        $headers[$col] = $normalizeHeader($label);
+                    }
+
+                    // Data rows
+                    for ($row = 2; $row <= $highestRow; $row++) {
+                        $record = [];
+                        for ($col = 1; $col <= $highestColumnIndex; $col++) {
+                            $headerKey = $headers[$col] ?? ('col_' . $col);
+                            $record[$headerKey] = trim((string)$worksheet->getCellByColumnAndRow($col, $row)->getValue());
+                        }
+                        // Skip completely empty rows
+                        $isEmpty = true;
+                        foreach ($record as $v) { if ($v !== '' && $v !== null) { $isEmpty = false; break; } }
+                        if (!$isEmpty) { $rows[] = $record; }
+                    }
+                } elseif ($ext === 'csv') {
+                    if (($handle = fopen($fileTmpPath, 'r')) === false) {
+                        handleError('Unable to open CSV file');
+                    }
+                    // Headers
+                    $raw = fgetcsv($handle);
+                    if ($raw === false) {
+                        fclose($handle);
+                        handleError('CSV file appears to be empty');
+                    }
+                    foreach ($raw as $i => $h) { $headers[$i] = $normalizeHeader($h); }
+                    // Rows
+                    while (($raw = fgetcsv($handle)) !== false) {
+                        $record = [];
+                        foreach ($raw as $i => $val) {
+                            $record[$headers[$i] ?? ('col_' . $i)] = trim((string)$val);
+                        }
+                        // Skip empty lines
+                        $isEmpty = true;
+                        foreach ($record as $v) { if ($v !== '' && $v !== null) { $isEmpty = false; break; } }
+                        if (!$isEmpty) { $rows[] = $record; }
+                    }
+                    fclose($handle);
+                } else {
+                    handleError('Invalid file type. Please upload .xlsx, .xls, or .csv');
+                }
+
+                // Expected keys (normalized); be lenient and only require the essentials
+                $required = ['budget_heading', 'activity', 'budget_line', 'description', 'partner', 'date', 'amount'];
+                $optional = ['outcome', 'currency', 'usd_to_etb_rate', 'eur_to_etb_rate', 'usd_to_etb', 'eur_to_etb', 'reference_number', 'pv_number'];
+
+                $imported = 0;
+                $errors = [];
+
+                // Utility: robust date parser (accept Y-m-d, d/m/Y, m/d/Y)
+                $parseDate = static function (string $str) {
+                    $str = trim($str);
+                    if ($str === '') return null;
+                    $fmts = ['Y-m-d', 'd/m/Y', 'm/d/Y', 'Y/m/d', 'd-m-Y', 'm-d-Y'];
+                    foreach ($fmts as $fmt) {
+                        $dt = DateTime::createFromFormat($fmt, $str);
+                        if ($dt && $dt->format($fmt) === $str) return $dt->format('Y-m-d');
+                    }
+                    // Try Excel serial dates
+                    if (is_numeric($str)) {
+                        try {
+                            $excelEpoch = DateTime::createFromFormat('Y-m-d', '1899-12-30');
+                            if ($excelEpoch) {
+                                $date = clone $excelEpoch;
+                                $date->modify('+' . intval($str) . ' days');
+                                return $date->format('Y-m-d');
+                            }
+                        } catch (Throwable $t) { /* ignore */ }
+                    }
+                    return null;
+                };
+
+                // Helper to run one transaction insert/update (mirrors save_transaction)
+                $processRow = function(array $r) use ($conn, $userCluster, $currencyRates) {
+                    // Pull fields with defaults
+                    $budgetHeading = trim((string)($r['budget_heading'] ?? ''));
+                    $outcome = trim((string)($r['outcome'] ?? ''));
+                    $activity = trim((string)($r['activity'] ?? ''));
+                    $budgetLine = trim((string)($r['budget_line'] ?? ''));
+                    $description = trim((string)($r['description'] ?? ''));
+                    $partner = trim((string)($r['partner'] ?? ''));
+                    $entryDate = trim((string)($r['date'] ?? ''));
+                    $amountOriginal = trim((string)($r['amount'] ?? ''));
+                    $currency = strtoupper(trim((string)($r['currency'] ?? 'ETB')));
+                    // Allow both *_rate and raw names
+                    $usdRate = $r['usd_to_etb_rate'] ?? ($r['usd_to_etb'] ?? null);
+                    $eurRate = $r['eur_to_etb_rate'] ?? ($r['eur_to_etb'] ?? null);
+                    $pvNumber = trim((string)($r['reference_number'] ?? ($r['pv_number'] ?? '')));
+
+                    if ($budgetHeading === '' || $activity === '' || $budgetLine === '' || $description === '' || $partner === '' || $entryDate === '' || $amountOriginal === '') {
+                        throw new Exception('Missing required fields');
+                    }
+                    if (!is_numeric($amountOriginal)) {
+                        throw new Exception('Amount must be numeric');
+                    }
+
+                    // Normalize category to match DB (strip numeric prefixes like "1. ...")
+                    $normalizeCategory = function(string $cat): string {
+                        $original = trim($cat);
+                        return preg_replace('/^\s*\d+\s*\.\s*/', '', $original);
+                    };
+                    $mappedCategoryName = $normalizeCategory($budgetHeading);
+
+                    // Build effective rates (override DB with custom rates if provided and enabled)
+                    $effectiveRates = $currencyRates;
+                    $useCustomRateFlag = 0;
+                    $usdToEtbPersist = null;
+                    $eurToEtbPersist = null;
+                    if (isClusterCustomCurrencyEnabled($conn, $userCluster)) {
+                        if ($usdRate !== null && is_numeric($usdRate) && floatval($usdRate) > 0) {
+                            $effectiveRates['USD_to_ETB'] = floatval($usdRate);
+                            $useCustomRateFlag = 1;
+                            $usdToEtbPersist = floatval($usdRate);
+                        }
+                        if ($eurRate !== null && is_numeric($eurRate) && floatval($eurRate) > 0) {
+                            $effectiveRates['EUR_to_ETB'] = floatval($eurRate);
+                            $useCustomRateFlag = 1;
+                            $eurToEtbPersist = floatval($eurRate);
+                        }
+                    }
+
+                    // Convert original amount to ETB so we can reuse the same accounting logic
+                    $amountETB = convertCurrency(floatval($amountOriginal), $currency, 'ETB', $effectiveRates);
+
+                    // Determine quarter and target budget row for this date/category
+                    $entryDateTime = new DateTime($entryDate);
+                    $entryYear = (int)$entryDateTime->format('Y');
+
+                    $quarterBudgetQuery = "SELECT id, period_name, budget, actual, forecast, variance_percentage, currency \
+                                 FROM budget_data \
+                                 WHERE year2 = ? AND category_name = ? \
+                                 AND period_name IN ('Q1', 'Q2', 'Q3', 'Q4') \
+                                 AND ? BETWEEN start_date AND end_date";
+                    if ($userCluster) { $quarterBudgetQuery .= " AND cluster = ?"; }
+                    $quarterBudgetQuery .= " LIMIT 1";
+
+                    if ($userCluster) {
+                        $stmtQ = $conn->prepare($quarterBudgetQuery);
+                        $stmtQ->bind_param("isss", $entryYear, $mappedCategoryName, $entryDateTime->format('Y-m-d'), $userCluster);
+                    } else {
+                        $stmtQ = $conn->prepare($quarterBudgetQuery);
+                        $stmtQ->bind_param("iss", $entryYear, $mappedCategoryName, $entryDateTime->format('Y-m-d'));
+                    }
+                    $stmtQ->execute();
+                    $resQ = $stmtQ->get_result();
+                    $quarterBudgetData = $resQ->fetch_assoc();
+
+                    $budgetId = $quarterBudgetData['id'] ?? null;
+                    $targetCurrency = $quarterBudgetData['currency'] ?? 'ETB';
+                    $quarterPeriod = $quarterBudgetData['period_name'] ?? 'Unknown';
+                    $originalBudget = (float)($quarterBudgetData['budget'] ?? 0);
+                    $currentActual = (float)($quarterBudgetData['actual'] ?? 0);
+                    $forecastAmount = (float)($quarterBudgetData['forecast'] ?? 0);
+                    $remainingBudget = $forecastAmount;
+                    $variancePercentage = (float)($quarterBudgetData['variance_percentage'] ?? 0);
+
+                    if ($quarterPeriod === 'Unknown') {
+                        throw new Exception('No budget period found for the transaction date');
+                    }
+
+                    // Convert ETB to budget currency for storage in preview/budget updates
+                    $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $targetCurrency, $effectiveRates);
+
+                    // Check if new rate columns exist
+                    $hasRatesCols = false; $dbNameX = '';
+                    if ($resDb = $conn->query("SELECT DATABASE() as db")) { $dbRowX = $resDb->fetch_assoc(); $dbNameX = $dbRowX['db'] ?? ''; }
+                    if ($dbNameX) {
+                        $checkSql = "SELECT COUNT(*) as cnt FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '" . $conn->real_escape_string($dbNameX) . "' AND TABLE_NAME = 'budget_preview' AND COLUMN_NAME = 'use_custom_rate'";
+                        if ($resCols = $conn->query($checkSql)) { $cntRow = $resCols->fetch_assoc(); $hasRatesCols = intval($cntRow['cnt'] ?? 0) > 0; }
+                    }
+
+                    // Insert into budget_preview
+                    if ($hasRatesCols) {
+                        $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE, use_custom_rate, usd_to_etb, eur_to_etb, usd_to_eur) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                        $empty = '';
+                        $actualSpent = $currentActual;
+                        $stmt->bind_param("sssssssdssssssssddssisssiddd",
+                            $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner,
+                            $entryDate, $amountInBudgetCurrency, $pvNumber, $empty, $empty, $empty,
+                            $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent,
+                            $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency,
+                            $empty, $empty, $useCustomRateFlag, $usdToEtbPersist, $eurToEtbPersist, $usdToEtbPersist /* keep slot */
+                        );
+                    } else {
+                        $stmt = $conn->prepare("INSERT INTO budget_preview (BudgetHeading, Outcome, Activity, BudgetLine, Description, Partner, EntryDate, Amount, PVNumber, DocumentPaths, DocumentTypes, OriginalNames, QuarterPeriod, CategoryName, OriginalBudget, RemainingBudget, ActualSpent, ForecastAmount, VariancePercentage, cluster, budget_id, currency, COMMENTS, ACCEPTANCE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                        $empty = '';
+                        $actualSpent = $currentActual;
+                        $stmt->bind_param("sssssssdssssssssddssisss",
+                            $budgetHeading, $outcome, $activity, $budgetLine, $description, $partner,
+                            $entryDate, $amountInBudgetCurrency, $pvNumber, $empty, $empty, $empty,
+                            $quarterPeriod, $mappedCategoryName, $originalBudget, $remainingBudget, $actualSpent,
+                            $forecastAmount, $variancePercentage, $userCluster, $budgetId, $targetCurrency, $empty, $empty
+                        );
+                    }
+
+                    if (!$stmt) { throw new Exception('Database prepare error: ' . $conn->error); }
+                    if (!$stmt->execute()) { throw new Exception('Database execute error: ' . $stmt->error); }
+                    $insertId = $stmt->insert_id;
+
+                    // Update budget_data for the selected quarter (add to actual, reduce forecast)
+                    $transactionDate = $entryDateTime->format('Y-m-d');
+                    $categoryName = $mappedCategoryName;
+                    $quarter = $quarterPeriod;
+                    $year = $entryYear;
+
+                    $budgetCheckQuery = "SELECT budget, actual, forecast, id, currency FROM budget_data \
+                                   WHERE year2 = ? AND category_name = ? \
+                                   AND period_name = ? \
+                                   AND ? BETWEEN start_date AND end_date";
+                    if ($userCluster) {
+                        $budgetCheckQuery .= " AND cluster = ?";
+                        $budgetCheckStmt = $conn->prepare($budgetCheckQuery);
+                        $budgetCheckStmt->bind_param("issss", $year, $categoryName, $quarter, $transactionDate, $userCluster);
+                    } else {
+                        $budgetCheckStmt = $conn->prepare($budgetCheckQuery);
+                        $budgetCheckStmt->bind_param("isss", $year, $categoryName, $quarter, $transactionDate);
+                    }
+                    $budgetCheckStmt->execute();
+                    $budgetCheckResult = $budgetCheckStmt->get_result();
+                    $budgetCheckData = $budgetCheckResult->fetch_assoc();
+
+                    $budgetCurrency = $budgetCheckData['currency'] ?? 'ETB';
+                    $amountInBudgetCurrency = convertCurrency($amountETB, 'ETB', $budgetCurrency, $effectiveRates);
+
+                    $updateBudgetQuery = "UPDATE budget_data SET \
+                        actual = COALESCE(actual, 0) + ?, \
+                        forecast = GREATEST(COALESCE(forecast, 0) - ?, 0), \
+                        actual_plus_forecast = COALESCE(actual, 0) + COALESCE(forecast, 0) \
+                        WHERE year2 = ? AND category_name = ? AND period_name = ? \
+                        AND ? BETWEEN start_date AND end_date";
+                    if ($userCluster) {
+                        $updateBudgetQuery .= " AND cluster = ?";
+                        $updateStmt = $conn->prepare($updateBudgetQuery);
+                        $updateStmt->bind_param("ddissss", $amountInBudgetCurrency, $amountInBudgetCurrency, $year, $categoryName, $quarter, $transactionDate, $userCluster);
+                    } else {
+                        $updateStmt = $conn->prepare($updateBudgetQuery);
+                        $updateStmt->bind_param("ddisss", $amountInBudgetCurrency, $amountInBudgetCurrency, $year, $categoryName, $quarter, $transactionDate);
+                    }
+                    $updateStmt->execute();
+
+                    // Mark uncertified for the year and cluster
+                    $uncertifyQuery = "UPDATE budget_data SET certified = 'uncertified' WHERE year2 = ?";
+                    if ($userCluster) { $uncertifyQuery .= " AND cluster = ?"; $uncertifyStmt = $conn->prepare($uncertifyQuery); $uncertifyStmt->bind_param("is", $year, $userCluster); }
+                    else { $uncertifyStmt = $conn->prepare($uncertifyQuery); $uncertifyStmt->bind_param("i", $year); }
+                    $uncertifyStmt->execute();
+
+                    // Sync annual totals and preview row the same way as save_transaction
+                    // Annual budget (sum of quarters)
+                    $updateAnnualQuery = "UPDATE budget_data \
+                        SET budget = ( \
+                            SELECT SUM(COALESCE(budget, 0)) \
+                            FROM budget_data b2 \
+                            WHERE b2.year2 = ? AND b2.category_name = ? AND b2.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                    if ($userCluster) { $updateAnnualQuery .= " AND b2.cluster = ?"; }
+                    $updateAnnualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                    if ($userCluster) { $updateAnnualQuery .= " AND cluster = ?"; $annualStmt = $conn->prepare($updateAnnualQuery); $annualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster); }
+                    else { $annualStmt = $conn->prepare($updateAnnualQuery); $annualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName); }
+                    $annualStmt->execute();
+
+                    // Annual actual (sum of quarters)
+                    $updateActualQuery = "UPDATE budget_data \
+                        SET actual = ( \
+                            SELECT SUM(COALESCE(actual, 0)) \
+                            FROM budget_data b3 \
+                            WHERE b3.year2 = ? AND b3.category_name = ? AND b3.period_name IN ('Q1', 'Q2', 'Q3', 'Q4')";
+                    if ($userCluster) { $updateActualQuery .= " AND b3.cluster = ?"; }
+                    $updateActualQuery .= ") WHERE year2 = ? AND category_name = ? AND period_name = 'Annual Total'";
+                    if ($userCluster) { $actualStmt = $conn->prepare($updateActualQuery); $actualStmt->bind_param("ississ", $year, $categoryName, $userCluster, $year, $categoryName, $userCluster); }
+                    else { $actualStmt = $conn->prepare($updateActualQuery); $actualStmt->bind_param("isis", $year, $categoryName, $year, $categoryName); }
+                    $actualStmt->execute();
+
+                    // Update preview row linkage and financial fields from budget_data
+                    if ($insertId && $budgetId) {
+                        $bdStmt = $conn->prepare("SELECT budget, actual, forecast, variance_percentage FROM budget_data WHERE id = ?");
+                        $bdStmt->bind_param("i", $budgetId);
+                        $bdStmt->execute();
+                        $bdRes = $bdStmt->get_result();
+                        if ($bdRow = $bdRes->fetch_assoc()) {
+                            $bdBudget = (float)($bdRow['budget'] ?? 0);
+                            $bdActual = (float)($bdRow['actual'] ?? 0);
+                            $bdForecast = (float)($bdRow['forecast'] ?? 0);
+                            $bdVariance = (float)($bdRow['variance_percentage'] ?? 0);
+                            $updatePreviewQuery = "UPDATE budget_preview SET budget_id = ?, currency = ?, OriginalBudget = ?, RemainingBudget = ?, ActualSpent = ?, ForecastAmount = ?, VariancePercentage = ? WHERE PreviewID = ?";
+                            $updatePreviewStmt = $conn->prepare($updatePreviewQuery);
+                            $updatePreviewStmt->bind_param("isdddddi", $budgetId, $targetCurrency, $bdBudget, $bdForecast, $bdActual, $bdForecast, $bdVariance, $insertId);
+                            $updatePreviewStmt->execute();
+                        }
+                    }
+
+                    return true;
+                };
+
+                // Process each row
+                foreach ($rows as $index => $row) {
+                    // Verify required fields exist in header mapping
+                    $missing = [];
+                    foreach ($required as $rk) {
+                        if (!array_key_exists($rk, $row) || trim((string)$row[$rk]) === '') { $missing[] = $rk; }
+                    }
+                    if (!empty($missing)) {
+                        $errors[] = 'Row ' . ($index + 2) . ': Missing required fields (' . implode(', ', $missing) . ')';
+                        continue;
+                    }
+
+                    // Normalize/parse date
+                    $parsedDate = $parseDate((string)$row['date']);
+                    if (!$parsedDate) {
+                        $errors[] = 'Row ' . ($index + 2) . ': Invalid date format';
+                        continue;
+                    }
+                    $row['date'] = $parsedDate;
+
+                    try {
+                        $ok = $processRow($row);
+                        if ($ok) { $imported++; }
+                    } catch (Throwable $t) {
+                        $errors[] = 'Row ' . ($index + 2) . ': ' . $t->getMessage();
+                    }
+                }
+
+                echo json_encode([
+                    'success' => true,
+                    'message' => 'Successfully imported ' . $imported . ' transaction(s)' . (count($errors) ? ' with ' . count($errors) . ' error(s)' : ''),
+                    'imported_count' => $imported,
+                    'errors' => $errors,
+                ]);
+                exit;
+
+            } catch (Throwable $e) {
+                handleError('Error importing transactions: ' . $e->getMessage());
+            }
+            break;
+
         case 'get_transactions':
             // Start session to get user cluster
             session_start();
